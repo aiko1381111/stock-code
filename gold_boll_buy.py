@@ -161,6 +161,7 @@ class GoldTradingBacktestEnhanced:
             'bb_std': 2,
             'buy_bb_lower_multiplier': 0.995,
             'buy_ma_period': 120,
+            'buy_ma60_period': 120,
             'sell_bb_upper_multiplier': 1.005,
             'stop_loss_percent': 0.92,
             'max_hold_days': 180
@@ -176,26 +177,7 @@ class GoldTradingBacktestEnhanced:
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
 
-        # 尝试从缓存获取
-        if self.cache_enabled and self.cache:
-            cached_df = self.cache.get(symbol, start_str, end_str)
-            if cached_df is not None:
-                cached_start = cached_df['date'].min()
-                cached_end = cached_df['date'].max()
-                request_start = pd.to_datetime(start_str)
-                request_end = pd.to_datetime(end_str)
 
-                if cached_start <= request_start and cached_end >= request_end:
-                    filtered_df = cached_df[
-                        (cached_df['date'] >= request_start) &
-                        (cached_df['date'] <= request_end)
-                        ].copy()
-
-                    if len(filtered_df) > 0:
-                        print(f"从缓存获取 {len(filtered_df)} 条数据")
-                        return filtered_df
-                else:
-                    print("缓存数据时间范围不足，从API获取")
 
         # 从API获取数据
         params = {
@@ -269,7 +251,8 @@ class GoldTradingBacktestEnhanced:
         # 计算120日简单移动平均线
         df['ma_120'] = df['close'].rolling(window=params['buy_ma_period'],
                                            min_periods=1).mean()
-
+        df['ma_60'] = df['close'].rolling(window=params['buy_ma60_period'],
+                                           min_periods=1).mean()
         # 计算布林带
         window = params['bb_period']
         df['bb_middle'] = df['close'].rolling(window=window, min_periods=1).mean()
@@ -282,11 +265,15 @@ class GoldTradingBacktestEnhanced:
         df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * params['bb_std'])
 
         # 计算价格与布林带上下轨的关系
-        df['below_bb_lower'] = df['low'] <= (df['bb_lower'] * params['buy_bb_lower_multiplier'])
-        df['above_bb_upper'] = df['high'] >= (df['bb_upper'] * params['sell_bb_upper_multiplier'])
+        df['below_bb_lower'] = df['low'] <= (df['bb_middle'] * params['buy_bb_lower_multiplier'])
+        df['above_bb_upper'] = df['high'] >= (df['bb_middle'] * params['sell_bb_upper_multiplier'])
+
+        df['below_bb_middle'] = df['low'] <= (df['bb_middle'] * params['buy_bb_lower_multiplier'])
+        df['above_bb_middle'] = df['high'] >= (df['bb_middle'] * params['sell_bb_upper_multiplier'])
 
         # 计算价格与120日均线的关系
         df['below_ma_120'] = df['low'] < df['ma_120']
+        df['below_ma_60'] = df['low'] < df['ma_60']
 
         # 向前填充NaN值
         df = df.fillna(method='ffill')
@@ -320,14 +307,10 @@ class GoldTradingBacktestEnhanced:
             current_date = current['date']
 
             # 买入条件
-            if position == 0:
-                condition1 = current['below_bb_lower']
-                #condition2 = current['below_ma_120']
-
-                if condition1 :
+            if position == 0 and current['below_bb_middle']:
+                # 只检查价格低于布林带下轨0.5%
                     position = 1
-                    buy_price = current[('low'
-                                         '')]
+                    buy_price = current['low']  # 改为使用收盘价
                     buy_date = current_date
                     entry_index = i
 
@@ -366,7 +349,7 @@ class GoldTradingBacktestEnhanced:
                     sell_price = current_close
 
                 # 正常卖出
-                elif current['above_bb_upper']:
+                elif current['above_bb_middle']:
                     sell_reason = '止盈'
                     should_sell = True
                     sell_price = current_close
@@ -470,7 +453,7 @@ class GoldTradingBacktestEnhanced:
             return pd.DataFrame()
 
 
-    def calculate_statistics(self, trades_df, initial_capital=10000):
+    def calculate_statistics(self,df, trades_df, initial_capital=10000):
         if trades_df.empty:
             return {}
 
@@ -544,11 +527,75 @@ class GoldTradingBacktestEnhanced:
         stats['max_drawdown_period'] = f"{max_drawdown_start} 到 {max_drawdown_end}" if max_drawdown_start else "N/A"
 
         # 夏普比率
-        returns = trades_df['return_rate'].values / 100
-        if len(returns) > 1 and np.std(returns) > 0:
-            stats['sharpe_ratio'] = (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+        # ========== 修正夏普比率计算 ==========
+        # 1. 先生成完整的日度资金曲线（从第一笔交易买入日到最后一天）
+        if not trades_df.empty:
+            # 确定回测的起止日期（使用整个数据框df的日期范围）
+            start_date = df['date'].min()
+            end_date = df['date'].max()
+            all_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+
+            # 创建一个与日期索引对应的DataFrame来存储净值
+            equity_curve = pd.DataFrame(index=all_dates)
+            equity_curve['capital'] = float(initial_capital)  # 初始资金
+
+            # 模拟每日净值变化：遍历每一天，根据持仓状态更新资金
+            current_capital = float(initial_capital)
+            current_position = 0  # 0表示空仓，1表示持多仓
+            position_entry_price = 0
+
+            for i in range(len(df)):
+                current_row = df.iloc[i]
+                current_date = current_row['date']
+
+                # 如果当天有信号，更新仓位和资金
+                if current_row['signal'] == 1:  # 买入信号
+                    current_position = 1
+                    position_entry_price = current_row['buy_price']
+                    # 买入不改变总资金，只是建立仓位
+                elif current_row['signal'] == -1:  # 卖出信号
+                    current_position = 0
+                    # 卖出时，根据这笔交易的收益率更新资金
+                    # 找到对应的交易记录（这里简化处理，实际应匹配交易记录）
+                    for _, trade in trades_df.iterrows():
+                        if trade['sell_date'].date() == current_date.date():
+                            return_rate = trade['return_rate'] / 100.0
+                            current_capital = current_capital * (1 + return_rate)
+                            break
+
+                # 记录当天的资金（如果是持仓状态，资金按市值计算）
+                if current_position == 1:
+                    # 持仓时，当前市值 = 资金 * (当前收盘价 / 买入价)
+                    current_value = current_capital * (current_row['close'] / position_entry_price)
+                    equity_curve.loc[current_date, 'capital'] = current_value
+                else:
+                    equity_curve.loc[current_date, 'capital'] = current_capital
+
+            # 前向填充缺失的日期（非交易日）
+            equity_curve['capital'].fillna(method='ffill', inplace=True)
+
+            # 2. 基于日度净值序列计算收益率和夏普比率
+            equity_curve['daily_return'] = equity_curve['capital'].pct_change().fillna(0)
+
+            # 计算年化收益率和年化波动率
+            annual_return = (equity_curve['daily_return'].mean() * 252) * 100  # 转为百分比
+            annual_volatility = (equity_curve['daily_return'].std() * np.sqrt(252)) * 100
+
+            # 设置无风险利率（例如年化2%）
+            risk_free_rate = 2.0  # 百分比
+
+            # 计算夏普比率
+            if annual_volatility > 0:
+                stats['sharpe_ratio'] = (annual_return - risk_free_rate) / annual_volatility
+            else:
+                stats['sharpe_ratio'] = 0
+
+            # 保存计算中间值供调试
+            stats['annual_return_from_curve'] = annual_return
+            stats['annual_volatility_from_curve'] = annual_volatility
         else:
             stats['sharpe_ratio'] = 0
+        # ========== 修正结束 ==========
 
         # 胜率按卖出原因分类
         if 'sell_reason' in trades_df.columns:
@@ -730,10 +777,9 @@ class GoldTradingBacktestEnhanced:
         print("增强版黄金交易策略回测结果")
         print("策略规则:")
         print("  买入条件:")
-        print("    1. 最低价 ≤ 布林日线下轨 × 0.995 (低于下轨0.5%)")
-        print("    2. 最低价 < 120日均线")
+        print("    价格低于布林带下轨0.5%")
         print("  卖出条件:")
-        print("    1. 最高价 > 布林日线上轨 × 1.005 (高于上轨0.5%)")
+        print("    1. 价格高于布林带上轨0.5% (止盈)")
         print("    2. 止损: 价格低于买入价92%")
         print("    3. 最大持有天数: 180天")
         print("=" * 80)
@@ -854,7 +900,7 @@ class GoldTradingBacktestEnhanced:
 
         # 5. 计算统计信息
         print("正在计算回测统计...")
-        stats = self.calculate_statistics(trades_df)
+        stats = self.calculate_statistics(df, trades_df)
 
         # 计算运行时间
         end_time = time.time()
@@ -875,60 +921,6 @@ def main():
     stop_loss = config.stop_loss
     max_hold_days = config.max_hold_days
 
-    # 配置参数
-    #DEFAULT_API_KEY = "1711a6d605444df78cfd2371e51e986b"
-
-    #print("配置回测参数:")
-
-    # 获取API密钥
-
-    #use_custom_key = input("是否使用自定义API密钥？(y/n, 默认n): ").strip().lower()
-
-    # if use_custom_key == 'y':
-    #     api_key = input("请输入您的Twelve Data API密钥: ").strip()
-    #     if not api_key:
-    #         print("未提供API密钥，使用演示密钥")
-    #         api_key = config.API_KEY
-    # else:
-    #     api_key = config.API_KEY
-    #     print(f"使用演示密钥: {api_key}")
-
-    # 是否启用缓存
-    # enable_cache = input("是否启用缓存？(y/n, 默认n): ").strip().lower()
-    # cache_enabled = not (enable_cache == 'y')
-    #
-    # if cache_enabled:
-    #     print("缓存已启用，数据将保存到./cache目录")
-    #
-    # # 回测年数
-    # try:
-    #     years = int(input("请输入回测年数 (默认2年): ").strip() or "2")
-    # except:
-    #     years = 2
-
-    # 策略参数调整
-    # print("\n策略参数调整 (按Enter使用默认值):")
-    #
-    # try:
-    #     stop_loss = float(input(f"止损比例 (默认0.92): ").strip() or "0.92")
-    #     if 0 < stop_loss < 1:
-    #         print(f"止损比例设置为: {stop_loss}")
-    #     else:
-    #         print("无效的止损比例，使用默认值0.92")
-    #         stop_loss = 0.92
-    # except:
-    #     stop_loss = 0.92
-
-    # try:
-    #     max_hold_days = int(input(f"最大持有天数 (默认180): ").strip() or "180")
-    #     if max_hold_days > 0:
-    #         print(f"最大持有天数设置为: {max_hold_days}")
-    #     else:
-    #         print("无效的天数，使用默认值180")
-    #         max_hold_days = 180
-    # except:
-    #     max_hold_days = 180
-
     try:
         # 初始化回测系统
         print(f"\n开始回测: {years}年数据，止损{stop_loss * 100:.0f}%，最大持有{max_hold_days}天")
@@ -945,10 +937,6 @@ def main():
             # 打印结果
             backtester.print_results(trades_df, stats)
 
-            # 绘制图表
-            # print("\n正在生成图表...")
-            # backtester.plot_results(df, trades_df)
-
             # 保存结果
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -963,7 +951,7 @@ def main():
             # 保存统计信息
             stats_file = f"gold_stats_{timestamp}.json"
             with open(stats_file, 'w', encoding='utf-8') as f:
-                json.dump(stats, f, ensure_ascii=False, indent=2)
+                json.dump(stats, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
 
             print(f"\n💾 结果已保存:")
             print(f"  交易记录: {trades_file}")
